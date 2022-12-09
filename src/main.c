@@ -1,714 +1,527 @@
-#include <zephyr/types.h>
-#include <zephyr.h>
-#include <drivers/uart.h>
-#include <drivers/gpio.h>
+// void app_error_fault_handler(uint32_t id, uint32_t pc, uint32_t info)
+// {
+//   __auto_type _err = (error_info_t *)info;
 
-#include <device.h>
-#include <devicetree.h>
-#include <soc.h>
+//   NRF_LOG_ERROR("{%s}[%d]\r\n", (uint32_t)_err->p_file_name, _err->line_num);
+//   NRF_LOG_FINAL_FLUSH();
+//   // On assert, the system can only recover with a reset.
+// #ifndef DEBUG
+//   NVIC_SystemReset();
+// #else
+//   app_error_save_and_stop(id, pc, info);
+// #endif // DEBUG
+// }
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/uuid.h>
-#include <bluetooth/gatt.h>
-#include <bluetooth/hci.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <string.h>
+#include "nordic_common.h"
+#include "nrf.h"
+#include "ble_hci.h"
+#include "ble_advdata.h"
+#include "ble_advertising.h"
+#include "ble_conn_params.h"
+#include "nrf_sdh.h"
+#include "nrf_sdh_soc.h"
+#include "nrf_sdh_ble.h"
+#include "nrf_ble_gatt.h"
+#include "nrf_ble_qwr.h"
+#include "app_timer.h"
+#include "app_uart.h"
+#include "app_util_platform.h"
+#include "bsp_btn_ble.h"
+#include "nrf_pwr_mgmt.h"
 
-#include <bluetooth/services/nus.h>
+#include "ble_linkyt.h"
+#include "teleinfo.h"
+#include "uart.h"
 
-#include <settings/settings.h>
+#include "nrf_log.h"
+#include "nrf_log_ctrl.h"
+#include "nrf_log_default_backends.h"
 
-#include <stdio.h>
+#define APP_BLE_CONN_CFG_TAG 1 /**< A tag identifying the SoftDevice BLE configuration. */
 
-#include <logging/log.h>
+#define DEVICE_NAME "Linkyt"                                /**< Name of device. Will be included in the advertising data. */
+#define LINKYT_SERVICE_UUID_TYPE BLE_UUID_TYPE_VENDOR_BEGIN /**< UUID type for the Linkyt service (vendor specific). */
 
-#define LOG_MODULE_NAME peripheral_uart
-LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+#define APP_BLE_OBSERVER_PRIO 3 /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 
-#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
-#define PRIORITY 7
+#define APP_ADV_INTERVAL 64 /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
 
-#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
-#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+#define APP_ADV_DURATION 18000 /**< The advertising duration (180 seconds) in units of 10 milliseconds. */
 
-/* Leds config */
-/* The devicetree node identifier for the "led0" alias. */
-#define LED0_NODE DT_ALIAS(led0)
-#define LED1_NODE DT_ALIAS(led1)
+#define MIN_CONN_INTERVAL MSEC_TO_UNITS(20, UNIT_1_25_MS)    /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
+#define MAX_CONN_INTERVAL MSEC_TO_UNITS(75, UNIT_1_25_MS)    /**< Maximum acceptable connection interval (75 ms), Connection interval uses 1.25 ms units. */
+#define SLAVE_LATENCY 0                                      /**< Slave latency. */
+#define CONN_SUP_TIMEOUT MSEC_TO_UNITS(4000, UNIT_10_MS)     /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
+#define FIRST_CONN_PARAMS_UPDATE_DELAY APP_TIMER_TICKS(5000) /**< Time from initiating event (connect or start of notification) to first time sd_ble_gap_conn_param_update is called (5 seconds). */
+#define NEXT_CONN_PARAMS_UPDATE_DELAY APP_TIMER_TICKS(30000) /**< Time between each call to sd_ble_gap_conn_param_update after the first call (30 seconds). */
+#define MAX_CONN_PARAMS_UPDATE_COUNT 3                       /**< Number of attempts before giving up the connection parameter negotiation. */
 
-#define LED0 DT_GPIO_LABEL(LED0_NODE, gpios)
-#define LED1 DT_GPIO_LABEL(LED1_NODE, gpios)
+#define DEAD_BEEF 0xDEADBEEF /**< Value used as error code on stack dump, can be used to identify stack location on stack unwind. */
 
-#define PIN_LED0 DT_GPIO_PIN(LED0_NODE, gpios)
-#define PIN_LED1 DT_GPIO_PIN(LED1_NODE, gpios)
+BLE_LINKYT_DEF(m_linky, NRF_SDH_BLE_TOTAL_LINK_COUNT); /**< BLE NUS service instance. */
+NRF_BLE_GATT_DEF(m_gatt);                              /**< GATT module instance. */
+NRF_BLE_QWR_DEF(m_qwr);                                /**< Context for the Queued Write module.*/
+BLE_ADVERTISING_DEF(m_advertising);                    /**< Advertising module instance. */
 
-#define FLAGS_LED0 DT_GPIO_FLAGS(LED0_NODE, gpios)
-#define FLAGS_LED1 DT_GPIO_FLAGS(LED1_NODE, gpios)
+static uint16_t m_conn_handle = BLE_CONN_HANDLE_INVALID;                  /**< Handle of the current connection. */
+static uint16_t m_ble_linkyt_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3; /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
+static ble_uuid_t m_adv_uuids[] =                                         /**< Universally unique service identifier. */
+    {
+        {BLE_UUID_LINKYT_SERVICE, LINKYT_SERVICE_UUID_TYPE}};
 
-#define RUN_LED_BLINK_INTERVAL 1000
-
-/* #define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
-#define KEY_PASSKEY_REJECT DK_BTN2_MSK */
-
-#define UART_BUF_SIZE CONFIG_BT_NUS_UART_BUFFER_SIZE
-#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
-#define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
-
-#define NUS_BUF_SIZE UART_BUF_SIZE
-
-static K_SEM_DEFINE(ble_init_ok, 0, 1);
-
-static struct bt_conn *current_conn;
-static struct bt_conn *auth_conn;
-
-static const struct device *uart;
-static const struct device *led0;
-static const struct device *led1;
-static struct k_delayed_work uart_work;
-
-struct uart_data_t
+/**
+ * @brief Function for assert macro callback.
+ *
+ * @details This function will be called in case of an assert in the SoftDevice.
+ *
+ * @warning On assert from the SoftDevice, the system can only recover on reset.
+ *
+ * @param[in] line_num    Line number of the failing ASSERT call.
+ * @param[in] p_file_name File name of the failing ASSERT call.
+ */
+void assert_nrf_callback(uint16_t line_num, const uint8_t *p_file_name)
 {
-   void *fifo_reserved;
-   uint8_t data[UART_BUF_SIZE];
-   uint16_t len;
-};
-
-static K_FIFO_DEFINE(fifo_uart_tx_data);
-static K_FIFO_DEFINE(fifo_uart_rx_data);
-
-static const struct bt_data ad[] = {
-    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
-};
-
-static const struct bt_data sd[] = {
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
-};
-
-/*
- *Called when data has been received from UART and allocated in memory
-*/
-static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
-{
-   ARG_UNUSED(dev);
-
-   static size_t aborted_len;
-   struct uart_data_t *buf;
-   static uint8_t *aborted_buf;
-   static int uart_cnt = 0;
-
-   switch (evt->type)
-   {
-   case UART_RX_RDY:
-      //LOG_WRN("UART_RX_RDY");
-
-      buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data);
-      buf->len += evt->data.rx.len;
-
-      /* Store into FIFO if buffer is full */
-      if (buf->len == UART_BUF_SIZE)
-      {
-         /* Remove parity bit from received octets */
-         for (size_t i = 0; i < buf->len; ++i)
-         {
-            evt->data.rx.buf[i] &= 0x7f;
-         }
-         /* Copy and put it inside FIFO
-         struct uart_data_t *buf_cpy = k_malloc(sizeof(*buf));
-         memcpy(buf_cpy, buf, sizeof(*buf));
-         k_fifo_put(&fifo_uart_rx_data, buf_cpy);*/
-         k_fifo_put(&fifo_uart_rx_data, buf);
-         uart_cnt++;
-         LOG_INF("uart_cnt: %d", uart_cnt);
-      }
-
-      break;
-
-   case UART_RX_DISABLED:
-      //LOG_WRN("UART_RX_DISABLED");
-      buf = k_malloc(sizeof(*buf));
-      if (buf)
-      {
-         buf->len = 0;
-      }
-      else
-      {
-         LOG_WRN("Not able to allocate UART receive buffer 1");
-         k_delayed_work_submit(&uart_work,
-                               UART_WAIT_FOR_BUF_DELAY);
-         return;
-      }
-
-      uart_rx_enable(uart, buf->data, sizeof(buf->data),
-                     UART_WAIT_FOR_RX);
-
-      break;
-
-   case UART_RX_BUF_REQUEST:
-      /*
-      * Allocates memory to store data received from UART
-      */
-      //LOG_WRN("UART_RX_BUF_REQUEST");
-      buf = k_malloc(sizeof(*buf));
-      if (buf)
-      {
-         buf->len = 0;
-         uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
-      }
-      else
-      {
-         LOG_WRN("Not able to allocate UART receive buffer 2");
-      }
-
-      break;
-
-   case UART_RX_BUF_RELEASED:
-      //LOG_WRN("UART_RX_BUF_RELEASED");
-      buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t,
-                         data);
-
-      //k_free(buf);
-
-      break;
-
-   case UART_RX_STOPPED:
-      //LOG_WRN("UART_RX_STOPPED");
-      break;
-
-   case UART_TX_ABORTED:
-      if (!aborted_buf)
-      {
-         aborted_buf = (uint8_t *)evt->data.tx.buf;
-      }
-
-      aborted_len += evt->data.tx.len;
-      buf = CONTAINER_OF(aborted_buf, struct uart_data_t,
-                         data);
-
-      uart_tx(uart, &buf->data[aborted_len],
-              buf->len - aborted_len, SYS_FOREVER_MS);
-
-      break;
-
-   case UART_TX_DONE:
-      if ((evt->data.tx.len == 0) ||
-          (!evt->data.tx.buf))
-      {
-         return;
-      }
-
-      if (aborted_buf)
-      {
-         buf = CONTAINER_OF(aborted_buf, struct uart_data_t,
-                            data);
-         aborted_buf = NULL;
-         aborted_len = 0;
-      }
-      else
-      {
-         buf = CONTAINER_OF(evt->data.tx.buf, struct uart_data_t,
-                            data);
-      }
-
-      k_free(buf);
-
-      buf = k_fifo_get(&fifo_uart_tx_data, K_NO_WAIT);
-      if (!buf)
-      {
-         return;
-      }
-
-      if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS))
-      {
-         LOG_WRN("Failed to send data over UART");
-      }
-
-      break;
-
-   default:
-      break;
-   }
+  app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
 
-static void uart_work_handler(struct k_work *item)
+/**
+ * @brief Function for initializing the timer module.
+ */
+static void timers_init(void)
 {
-   struct uart_data_t *buf;
-   LOG_WRN("uart_work_handler");
-
-   buf = k_malloc(sizeof(*buf));
-   if (buf)
-   {
-      buf->len = 0;
-   }
-   else
-   {
-      LOG_WRN("Not able to allocate UART receive buffer 3");
-      k_delayed_work_submit(&uart_work, UART_WAIT_FOR_BUF_DELAY);
-      return;
-   }
-
-   uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+  ret_code_t err_code = app_timer_init();
+  APP_ERROR_CHECK(err_code);
 }
 
-static int uart_init(void)
+/**
+ * @brief Function for the GAP initialization.
+ *
+ * @details This function will set up all the necessary GAP (Generic Access Profile) parameters of
+ *          the device. It also sets the permissions and appearance.
+ */
+static void gap_params_init(void)
 {
-   int err;
-   struct uart_data_t *rx;
+  uint32_t err_code;
+  ble_gap_conn_params_t gap_conn_params;
+  ble_gap_conn_sec_mode_t sec_mode;
 
-   uart = device_get_binding(DT_LABEL(DT_NODELABEL(uart0)));
-   if (!uart)
-   {
-      return -ENXIO;
-   }
+  BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
 
-   struct uart_config uart_cfg = {
-       .baudrate = 1200,
-       .data_bits = UART_CFG_DATA_BITS_8,
-       .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
-       .parity = UART_CFG_PARITY_NONE,
-       .stop_bits = UART_CFG_STOP_BITS_1};
+  err_code = sd_ble_gap_device_name_set(&sec_mode,
+                                        (const uint8_t *)DEVICE_NAME,
+                                        strlen(DEVICE_NAME));
+  APP_ERROR_CHECK(err_code);
 
-   /*    struct uart_config uart_cfg_init;
-   uart_config_get(uart, &uart_cfg_init);
-   LOG_INF("baudrate: %u", uart_cfg_init.baudrate);
-   LOG_INF("parity: %u", uart_cfg_init.parity);
-   LOG_INF("stop_bits: %u", uart_cfg_init.stop_bits);
-   LOG_INF("data_bits: %u", uart_cfg_init.data_bits);
-   LOG_INF("flow_ctrl: %u", uart_cfg_init.flow_ctrl); */
+  memset(&gap_conn_params, 0, sizeof(gap_conn_params));
 
-   /* Configure speed */
-   err = uart_configure(uart, &uart_cfg);
-   if (err)
-   {
-      LOG_ERR("Failed to configure UART (err %d)", err);
-      return err;
-   }
+  gap_conn_params.min_conn_interval = MIN_CONN_INTERVAL;
+  gap_conn_params.max_conn_interval = MAX_CONN_INTERVAL;
+  gap_conn_params.slave_latency = SLAVE_LATENCY;
+  gap_conn_params.conn_sup_timeout = CONN_SUP_TIMEOUT;
 
-   rx = k_malloc(sizeof(*rx));
-   if (rx)
-   {
-      rx->len = 0;
-   }
-   else
-   {
-      return -ENOMEM;
-   }
-
-   k_delayed_work_init(&uart_work, uart_work_handler);
-
-   err = uart_callback_set(uart, uart_cb, NULL);
-   if (err)
-   {
-      LOG_ERR("Failed to configure UART callback (err %d)", err);
-      return err;
-   }
-
-   return uart_rx_enable(uart, rx->data, sizeof(rx->data), UART_WAIT_FOR_RX);
+  err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
+  APP_ERROR_CHECK(err_code);
 }
 
-static void connected(struct bt_conn *conn, uint8_t err)
+/**
+ * @brief Function for handling Queued Write Module errors.
+ *
+ * @details A pointer to this function will be passed to each service which may need to inform the
+ *          application about an error.
+ *
+ * @param[in]   nrf_error   Error code containing information about what went wrong.
+ */
+static void nrf_qwr_error_handler(uint32_t nrf_error)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
-
-   if (err)
-   {
-      LOG_ERR("Connection failed (err %u)", err);
-      return;
-   }
-
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-   LOG_INF("Connected %s", log_strdup(addr));
-
-   current_conn = bt_conn_ref(conn);
-
-   gpio_pin_set(led1, PIN_LED1, 1);
+  APP_ERROR_HANDLER(nrf_error);
 }
 
-static void disconnected(struct bt_conn *conn, uint8_t reason)
+/**
+ * @brief   Function for handling app_uart events.
+ */
+void linkyt_uart_event_handle(const uint8_t *frame, const uint16_t frame_len)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  teleinfo_data_t data = {0};
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+  /* Parse teleinfo data */
+  int32_t rc = teleinfo_parse_frame(frame, frame_len, &data);
 
-   LOG_INF("Disconnected: %s (reason %u)", log_strdup(addr), reason);
+  if (rc != TELEINFO_SUCCESS)
+  {
+    NRF_LOG_ERROR("Cannot parse teleinfo frame");
+    return;
+  }
 
-   if (auth_conn)
-   {
-      bt_conn_unref(auth_conn);
-      auth_conn = NULL;
-   }
+  // Quickly blink led
+  uint32_t err_code = bsp_indication_set(BSP_INDICATE_RCV_OK);
 
-   if (current_conn)
-   {
-      bt_conn_unref(current_conn);
-      current_conn = NULL;
-      gpio_pin_set(led1, PIN_LED1, 0);
-   }
+  err_code = ble_linkyt_data_send(&m_linky, &data, m_conn_handle);
+  NRF_LOG_INFO("ble_linkyt_data_send rc=%" PRIu32, err_code);
+  if ((err_code != NRF_ERROR_INVALID_STATE) &&
+      (err_code != NRF_ERROR_RESOURCES) &&
+      (err_code != NRF_ERROR_NOT_FOUND))
+  {
+    APP_ERROR_CHECK(err_code);
+  }
 }
 
-#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
-static void security_changed(struct bt_conn *conn, bt_security_t level,
-                             enum bt_security_err err)
+/**
+ * @brief Function for initializing services that will be used by the application.
+ */
+static void services_init(void)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  uint32_t err_code;
+  nrf_ble_qwr_init_t qwr_init = {0};
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+  // Initialize Queued Write Module.
+  qwr_init.error_handler = nrf_qwr_error_handler;
 
-   if (!err)
-   {
-      LOG_INF("Security changed: %s level %u", log_strdup(addr),
-              level);
-   }
-   else
-   {
-      LOG_WRN("Security failed: %s level %u err %d", log_strdup(addr),
-              level, err);
-   }
-}
-#endif
+  err_code = nrf_ble_qwr_init(&m_qwr, &qwr_init);
+  APP_ERROR_CHECK(err_code);
 
-static struct bt_conn_cb conn_callbacks = {
-    .connected = connected,
-    .disconnected = disconnected,
-#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
-    .security_changed = security_changed,
-#endif
-};
+  err_code = ble_linkyt_init(&m_linky);
+  APP_ERROR_CHECK(err_code);
 
-#if defined(CONFIG_BT_NUS_SECURITY_ENABLED)
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
-{
-   char addr[BT_ADDR_LE_STR_LEN];
-
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-   LOG_INF("Passkey for %s: %06u", log_strdup(addr), passkey);
+  linkyt_uart_config_t uart_cfg = {
+      .evt_handler = linkyt_uart_event_handle};
+  err_code = uart_init(&uart_cfg);
+  APP_ERROR_CHECK(err_code);
 }
 
-static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+/**
+ * @brief Function for handling an event from the Connection Parameters Module.
+ *
+ * @details This function will be called for all events in the Connection Parameters Module
+ *          which are passed to the application.
+ *
+ * @note All this function does is to disconnect. This could have been done by simply setting
+ *       the disconnect_on_fail config parameter, but instead we use the event handler
+ *       mechanism to demonstrate its use.
+ *
+ * @param[in] p_evt  Event received from the Connection Parameters Module.
+ */
+static void on_conn_params_evt(ble_conn_params_evt_t *p_evt)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  uint32_t err_code;
 
-   auth_conn = bt_conn_ref(conn);
-
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-   LOG_INF("Passkey for %s: %06u", log_strdup(addr), passkey);
-   LOG_INF("Press Button 1 to confirm, Button 2 to reject.");
+  if (p_evt->evt_type == BLE_CONN_PARAMS_EVT_FAILED)
+  {
+    err_code = sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_CONN_INTERVAL_UNACCEPTABLE);
+    APP_ERROR_CHECK(err_code);
+  }
 }
 
-static void auth_cancel(struct bt_conn *conn)
+/**
+ * @brief Function for handling errors from the Connection Parameters module.
+ *
+ * @param[in] nrf_error  Error code containing information about what went wrong.
+ */
+static void conn_params_error_handler(uint32_t nrf_error)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
-
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-   LOG_INF("Pairing cancelled: %s", log_strdup(addr));
+  APP_ERROR_HANDLER(nrf_error);
 }
 
-static void pairing_confirm(struct bt_conn *conn)
+/**
+ * @brief Function for initializing the Connection Parameters module.
+ */
+static void conn_params_init(void)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  uint32_t err_code;
+  ble_conn_params_init_t cp_init;
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+  memset(&cp_init, 0, sizeof(cp_init));
 
-   bt_conn_auth_pairing_confirm(conn);
+  cp_init.p_conn_params = NULL;
+  cp_init.first_conn_params_update_delay = FIRST_CONN_PARAMS_UPDATE_DELAY;
+  cp_init.next_conn_params_update_delay = NEXT_CONN_PARAMS_UPDATE_DELAY;
+  cp_init.max_conn_params_update_count = MAX_CONN_PARAMS_UPDATE_COUNT;
+  cp_init.start_on_notify_cccd_handle = BLE_GATT_HANDLE_INVALID;
+  cp_init.disconnect_on_fail = false;
+  cp_init.evt_handler = on_conn_params_evt;
+  cp_init.error_handler = conn_params_error_handler;
 
-   LOG_INF("Pairing confirmed: %s", log_strdup(addr));
+  err_code = ble_conn_params_init(&cp_init);
+  APP_ERROR_CHECK(err_code);
 }
 
-static void pairing_complete(struct bt_conn *conn, bool bonded)
+/**
+ * @brief Function for starting advertising.
+ */
+static void advertising_start(void)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  uint32_t err_code = sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_ADV, m_advertising.adv_handle, 8);
+  APP_ERROR_CHECK(err_code);
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-   LOG_INF("Pairing completed: %s, bonded: %d", log_strdup(addr),
-           bonded);
+  err_code = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
+  APP_ERROR_CHECK(err_code);
 }
 
-static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+/**
+ * @brief Function for handling advertising events.
+ *
+ * @details This function will be called for advertising events which are passed to the application.
+ *
+ * @param[in] ble_adv_evt  Advertising event.
+ */
+static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
 {
-   char addr[BT_ADDR_LE_STR_LEN];
+  uint32_t err_code;
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-   LOG_INF("Pairing failed conn: %s, reason %d", log_strdup(addr),
-           reason);
+  switch (ble_adv_evt)
+  {
+  case BLE_ADV_EVT_FAST:
+    err_code = bsp_indication_set(BSP_INDICATE_ADVERTISING);
+    APP_ERROR_CHECK(err_code);
+    break;
+  case BLE_ADV_EVT_IDLE:
+    advertising_start();
+    break;
+  default:
+    break;
+  }
 }
 
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-    .passkey_display = auth_passkey_display,
-    .passkey_confirm = auth_passkey_confirm,
-    .cancel = auth_cancel,
-    .pairing_confirm = pairing_confirm,
-    .pairing_complete = pairing_complete,
-    .pairing_failed = pairing_failed};
-#else
-static struct bt_conn_auth_cb conn_auth_callbacks;
-#endif
-
-static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data,
-                          uint16_t len)
+/**
+ * @brief Function for handling BLE events.
+ *
+ * @param[in]   p_ble_evt   Bluetooth stack event.
+ * @param[in]   p_context   Unused.
+ */
+static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
 {
-   int err;
-   char addr[BT_ADDR_LE_STR_LEN] = {0};
+  uint32_t err_code;
 
-   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, ARRAY_SIZE(addr));
+  switch (p_ble_evt->header.evt_id)
+  {
+  case BLE_GAP_EVT_CONNECTED:
+    NRF_LOG_INFO("Connected");
+    err_code = bsp_indication_set(BSP_INDICATE_CONNECTED);
+    APP_ERROR_CHECK(err_code);
+    m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
+    err_code = nrf_ble_qwr_conn_handle_assign(&m_qwr, m_conn_handle);
+    APP_ERROR_CHECK(err_code);
+    break;
 
-   LOG_INF("Received data from: %s", log_strdup(addr));
+  case BLE_GAP_EVT_DISCONNECTED:
+    NRF_LOG_INFO("Disconnected");
+    // LED indication will be changed when advertising starts.
+    m_conn_handle = BLE_CONN_HANDLE_INVALID;
+    break;
 
-   for (uint16_t pos = 0; pos != len;)
-   {
-      struct uart_data_t *tx = k_malloc(sizeof(*tx));
+  case BLE_GAP_EVT_PHY_UPDATE_REQUEST:
+  {
+    NRF_LOG_DEBUG("PHY update request.");
+    ble_gap_phys_t const phys =
+        {
+            .rx_phys = BLE_GAP_PHY_AUTO,
+            .tx_phys = BLE_GAP_PHY_AUTO,
+        };
+    err_code = sd_ble_gap_phy_update(p_ble_evt->evt.gap_evt.conn_handle, &phys);
+    APP_ERROR_CHECK(err_code);
+  }
+  break;
 
-      if (!tx)
-      {
-         LOG_WRN("Not able to allocate UART send data buffer");
-         return;
-      }
+  case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
+    // Pairing not supported
+    err_code = sd_ble_gap_sec_params_reply(m_conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
+    APP_ERROR_CHECK(err_code);
+    break;
 
-      /* Keep the last byte of TX buffer for potential LF char. */
-      size_t tx_data_size = sizeof(tx->data) - 1;
+  case BLE_GATTS_EVT_SYS_ATTR_MISSING:
+    // No system attributes have been stored.
+    err_code = sd_ble_gatts_sys_attr_set(m_conn_handle, NULL, 0, 0);
+    APP_ERROR_CHECK(err_code);
+    break;
 
-      if ((len - pos) > tx_data_size)
-      {
-         tx->len = tx_data_size;
-      }
-      else
-      {
-         tx->len = (len - pos);
-      }
+  case BLE_GATTC_EVT_TIMEOUT:
+    // Disconnect on GATT Client timeout event.
+    err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gattc_evt.conn_handle,
+                                     BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    APP_ERROR_CHECK(err_code);
+    break;
 
-      memcpy(tx->data, &data[pos], tx->len);
+  case BLE_GATTS_EVT_TIMEOUT:
+    // Disconnect on GATT Server timeout event.
+    err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gatts_evt.conn_handle,
+                                     BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    APP_ERROR_CHECK(err_code);
+    break;
 
-      pos += tx->len;
-
-      /* Append the LF character when the CR character triggered
-       * transmission from the peer.
-       */
-      if ((pos == len) && (data[len - 1] == '\r'))
-      {
-         tx->data[tx->len] = '\n';
-         tx->len++;
-      }
-
-      err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
-      if (err)
-      {
-         k_fifo_put(&fifo_uart_tx_data, tx);
-      }
-   }
+  default:
+    // No implementation needed.
+    break;
+  }
 }
 
-static struct bt_nus_cb nus_cb = {
-    .received = bt_receive_cb,
-};
-
-void error(void)
+/**
+ * @brief Function for the SoftDevice initialization.
+ *
+ * @details This function initializes the SoftDevice and the BLE event interrupt.
+ */
+static void ble_stack_init(void)
 {
-   gpio_pin_set(led0, PIN_LED0, 0);
-   gpio_pin_set(led1, PIN_LED1, 0);
+  ret_code_t err_code;
 
-   while (true)
-   {
-      /* Spin for ever */
-      k_sleep(K_MSEC(1000));
-   }
+  err_code = nrf_sdh_enable_request();
+  APP_ERROR_CHECK(err_code);
+
+  // Configure the BLE stack using the default settings.
+  // Fetch the start address of the application RAM.
+  uint32_t ram_start = 0;
+  err_code = nrf_sdh_ble_default_cfg_set(APP_BLE_CONN_CFG_TAG, &ram_start);
+  APP_ERROR_CHECK(err_code);
+
+  // Enable BLE stack.
+  err_code = nrf_sdh_ble_enable(&ram_start);
+  APP_ERROR_CHECK(err_code);
+
+  // Register a handler for BLE events.
+  NRF_SDH_BLE_OBSERVER(m_ble_observer, APP_BLE_OBSERVER_PRIO, ble_evt_handler, NULL);
 }
 
-/* static void num_comp_reply(bool accept)
+/**
+ * @brief Function for handling events from the GATT library.
+ */
+void gatt_evt_handler(nrf_ble_gatt_t *p_gatt, nrf_ble_gatt_evt_t const *p_evt)
 {
-   if (accept) {
-      bt_conn_auth_passkey_confirm(auth_conn);
-      LOG_INF("Numeric Match, conn %p", auth_conn);
-   } else {
-      bt_conn_auth_cancel(auth_conn);
-      LOG_INF("Numeric Reject, conn %p", auth_conn);
-   }
-
-   bt_conn_unref(auth_conn);
-   auth_conn = NULL;
+  if ((m_conn_handle == p_evt->conn_handle) && (p_evt->evt_id == NRF_BLE_GATT_EVT_ATT_MTU_UPDATED))
+  {
+    m_ble_linkyt_max_data_len = p_evt->params.att_mtu_effective - OPCODE_LENGTH - HANDLE_LENGTH;
+    NRF_LOG_INFO("Data len is set to 0x%X(%d)", m_ble_linkyt_max_data_len, m_ble_linkyt_max_data_len);
+  }
+  NRF_LOG_DEBUG("ATT MTU exchange completed. central 0x%x peripheral 0x%x",
+                p_gatt->att_mtu_desired_central,
+                p_gatt->att_mtu_desired_periph);
 }
 
-void button_changed(uint32_t button_state, uint32_t has_changed)
+/**
+ * @brief Function for initializing the GATT library.
+ */
+void gatt_init(void)
 {
-   uint32_t buttons = button_state & has_changed;
+  ret_code_t err_code;
 
-   if (auth_conn) {
-      if (buttons & KEY_PASSKEY_ACCEPT) {
-         num_comp_reply(true);
-      }
+  err_code = nrf_ble_gatt_init(&m_gatt, gatt_evt_handler);
+  APP_ERROR_CHECK(err_code);
 
-      if (buttons & KEY_PASSKEY_REJECT) {
-         num_comp_reply(false);
-      }
-   }
-} */
-
-static int configure_gpio(void)
-{
-   int ret = 0;
-   led0 = device_get_binding(LED0);
-   led1 = device_get_binding(LED1);
-   if (!led0 || !led1)
-   {
-      return -ENXIO;
-   }
-
-   ret = gpio_pin_configure(led0, PIN_LED0, GPIO_OUTPUT_ACTIVE | FLAGS_LED0);
-   if (ret < 0)
-   {
-      return ret;
-   }
-
-   ret = gpio_pin_configure(led1, PIN_LED1, GPIO_OUTPUT_INACTIVE | FLAGS_LED1);
-   if (ret < 0)
-   {
-      return ret;
-   }
-   return ret;
+  err_code = nrf_ble_gatt_att_mtu_periph_set(&m_gatt, NRF_SDH_BLE_GATT_MAX_MTU_SIZE);
+  APP_ERROR_CHECK(err_code);
 }
 
-void main(void)
+/**
+ * @brief Function for initializing the Advertising functionality.
+ */
+static void advertising_init(void)
 {
-   int blink_status = 0;
-   int err = 0;
+  uint32_t err_code;
+  ble_advertising_init_t init;
 
-   err = configure_gpio();
-   if (err)
-   {
-      error();
-   }
+  memset(&init, 0, sizeof(init));
 
-   err = uart_init();
-   if (err)
-   {
-      error();
-   }
+  init.advdata.name_type = BLE_ADVDATA_FULL_NAME;
+  init.advdata.include_appearance = false;
+  init.advdata.flags = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
 
-   bt_conn_cb_register(&conn_callbacks);
+  init.advdata.uuids_complete.uuid_cnt = sizeof(m_adv_uuids) / sizeof(m_adv_uuids[0]);
+  init.advdata.uuids_complete.p_uuids = m_adv_uuids;
 
-   if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED))
-   {
-      bt_conn_auth_cb_register(&conn_auth_callbacks);
-   }
+  init.config.ble_adv_fast_enabled = true;
+  init.config.ble_adv_fast_interval = APP_ADV_INTERVAL;
+  init.config.ble_adv_fast_timeout = APP_ADV_DURATION;
+  init.config.ble_adv_primary_phy = BLE_GAP_PHY_1MBPS;
+  init.config.ble_adv_secondary_phy = BLE_GAP_PHY_CODED;
+  //init.config.ble_adv_extended_enabled  = true;
 
-   err = bt_enable(NULL);
-   if (err)
-   {
-      error();
-   }
+  init.evt_handler = on_adv_evt;
 
-   LOG_INF("Bluetooth initialized");
+  err_code = ble_advertising_init(&m_advertising, &init);
+  APP_ERROR_CHECK(err_code);
 
-   k_sem_give(&ble_init_ok);
-
-   if (IS_ENABLED(CONFIG_SETTINGS))
-   {
-      settings_load();
-   }
-
-   err = bt_nus_init(&nus_cb);
-   if (err)
-   {
-      LOG_ERR("Failed to initialize UART service (err: %d)", err);
-      return;
-   }
-
-   err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd,
-                         ARRAY_SIZE(sd));
-   if (err)
-   {
-      LOG_ERR("Advertising failed to start (err %d)", err);
-   }
-
-   printk("Starting Linky UART service\n");
-
-   for (;;)
-   {
-      gpio_pin_set(led0, PIN_LED0, (++blink_status) % 2);
-      k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
-   }
+  ble_advertising_conn_cfg_tag_set(&m_advertising, APP_BLE_CONN_CFG_TAG);
 }
 
-void ble_write_thread(void)
+/**
+ * @brief Function for initializing buttons and leds.
+ *
+ * @param[out] p_erase_bonds  Will be true if the clear bonding button was pressed to wake the application up.
+ */
+static void buttons_leds_init(bool *p_erase_bonds)
 {
-   /* Buffer containing one line of data to send over BLE */
-   static uint8_t data_line[NUS_BUF_SIZE] = {0};
-   static size_t data_line_len = 0;
-   static bool should_store = false;
-   static int data_cnt = 0;
+  bsp_event_t startup_event;
 
-   /* Don't go any further until BLE is initialized */
-   k_sem_take(&ble_init_ok, K_FOREVER);
+  uint32_t err_code = bsp_init(BSP_INIT_LEDS | BSP_INIT_BUTTONS, NULL);
+  APP_ERROR_CHECK(err_code);
 
-   for (;;)
-   {
-      /* Wait indefinitely for data to be sent over bluetooth */
-      struct uart_data_t *data_buf = k_fifo_get(&fifo_uart_rx_data,
-                                                K_FOREVER);
-      data_cnt++;
-      LOG_INF("data_cnt: %d", data_cnt);
+  err_code = bsp_btn_ble_init(NULL, &startup_event);
+  APP_ERROR_CHECK(err_code);
 
-      LOG_WRN("ble_write_thread; %d", data_buf->len);
-
-      /* Walk char by char */
-      size_t i_char = 0;
-      for (i_char = 0; i_char < data_buf->len; ++i_char)
-      {
-         LOG_INF("data_buf->data[%d]= %#02x | %c", i_char, data_buf->data[i_char], data_buf->data[i_char]);
-         /* The STX or ETX char */
-         if (data_buf->data[i_char] == 0x02 || data_buf->data[i_char] == 0x03)
-         {
-            int r = bt_nus_send(NULL, &data_buf->data[i_char], 1);
-            if (r < 0)
-            {
-               LOG_WRN("Failed to send STX or ETX over BLE connection, err(%d)", r);
-            }
-         }
-         /* The CR char */
-         else if (data_buf->data[i_char] == 0x0d)
-         {
-            /* This is the end of a sentence, send it! */
-            if (should_store && data_line_len > 2)
-            {
-               int r = bt_nus_send(NULL, data_line, data_line_len - 2);
-               if (r < 0)
-               {
-                  LOG_WRN("Failed to send data over BLE connection, err(%d)", r);
-               }
-            }
-            else
-            {
-               should_store = false;
-               data_line_len = 0;
-            }
-         }
-         /* The LF char */
-         else if (data_buf->data[i_char] == 0x0a)
-         {
-            /* This is the start of a sentence, store next chars */
-            data_line_len = 0;
-            should_store = true;
-         }
-         else if (should_store)
-         {
-            /* Should we store this? */
-            if (data_line_len < NUS_BUF_SIZE)
-            {
-               data_line[data_line_len] = data_buf->data[i_char];
-               data_line_len++;
-            }
-            else
-            {
-               LOG_WRN("Sending buffer is full! Sentence is too long!");
-               should_store = false;
-            }
-         }
-      }
-
-      k_free(data_buf);
-   }
+  *p_erase_bonds = (startup_event == BSP_EVENT_CLEAR_BONDING_DATA);
 }
 
-K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL,
-                NULL, PRIORITY, 0, 0);
+/**
+ * @brief Function for initializing the nrf log module.
+ */
+static void log_init(void)
+{
+  ret_code_t err_code = NRF_LOG_INIT(NULL);
+  APP_ERROR_CHECK(err_code);
+
+  NRF_LOG_DEFAULT_BACKENDS_INIT();
+}
+
+/**
+ * @brief Function for initializing power management.
+ */
+static void power_management_init(void)
+{
+  ret_code_t err_code;
+  err_code = nrf_pwr_mgmt_init();
+  APP_ERROR_CHECK(err_code);
+}
+
+/**
+ * @brief Function for handling the idle state (main loop).
+ *
+ * @details If there is no pending log operation, then sleep until next the next event occurs.
+ */
+static void idle_state_handle(void)
+{
+  if (NRF_LOG_PROCESS() == false)
+  {
+    nrf_pwr_mgmt_run();
+  }
+}
+
+/**
+ * @brief Application main function.
+ */
+int main(void)
+{
+  bool erase_bonds;
+
+  // Initialize.
+  log_init();
+  timers_init();
+  buttons_leds_init(&erase_bonds);
+  power_management_init();
+  ble_stack_init();
+  gap_params_init();
+  gatt_init();
+  services_init();
+  advertising_init();
+  conn_params_init();
+
+  // Start execution.
+  printf("\r\nUART started.\r\n");
+  NRF_LOG_INFO("Debug logging for UART over RTT started.");
+  advertising_start();
+
+  // Enter main loop.
+  for (;;)
+  {
+    idle_state_handle();
+  }
+}

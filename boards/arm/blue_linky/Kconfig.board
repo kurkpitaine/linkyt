@@ -1,8 +1,0 @@
-# Blue Linky board configuration
-
-# Copyright (c) 2021 Thibaud Rouillé
-# SPDX-License-Identifier: Apache-2.0
-
-config BOARD_BLUE_LINKY
-	bool "Blue Linky"
-	depends on SOC_NRF52840_QIAA

@@ -1,0 +1,67 @@
+{
+    "env": {
+        "nrfSDK": "${workspaceFolder}/sdk/nRF5_SDK_17.1.0_ddde560"
+    },
+    "configurations": [
+        {
+            "name": "ARM GCC",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/src",
+                "${nrfSDK}/components/**",
+                "${nrfSDK}/components",
+                "${nrfSDK}/components/softdevice/s140/headers",
+                "${nrfSDK}/components/libraries/uart",
+                "",
+                "${nrfSDK}/components/libraries/experimental_memobj",
+                "${nrfSDK}/components/libraries/experimental_section_vars",
+                "${nrfSDK}/modules/nrfx/mdk",
+                "${nrfSDK}/modules/nrfx/hal",
+                "${nrfSDK}/components/libraries/balloc",
+                "${nrfSDK}/components/libraries/experimental_log",
+                "${nrfSDK}/components/libraries/experimental_log/src",
+                "${nrfSDK}/components/libraries/delay",
+                "${nrfSDK}/integration/nrfx",
+                "${nrfSDK}/components/libraries/bsp",
+                "${nrfSDK}/components/drivers_nrf/nrf_soc_nosd",
+                "${nrfSDK}/components/libraries/strerror",
+                "${nrfSDK}/components/boards",
+                "${nrfSDK}/components/toolchain/cmsis/include",
+                "${nrfSDK}/modules/nrfx",
+                "${nrfSDK}/components/libraries/util",
+                "${nrfSDK}/components/libraries/fifo",
+                "${nrfSDK}/integration/nrfx/legacy",
+                "${nrfSDK}/components/libraries/delay",
+                "${nrfSDK}/modules/nrfx/drivers/include"
+            ],
+            "defines": [
+                "DEBUG",
+                "CUSTOM_BOARD_INC=feather_nrf52840_board",
+                "NRF52840_XXAA",
+                "FLOAT_ABI_HARD",
+                "CONFIG_GPIO_AS_PINRESET",
+                "CONFIG_NFCT_PINS_AS_GPIOS",
+                "NRF_SD_BLE_API_VERSION=7",
+                "S140",
+                "SOFTDEVICE_PRESENT",
+                "APP_FIFO_ENABLED",
+                "APP_TIMER_V2",
+                "APP_TIMER_V2_RTC1_ENABLED",
+                "APP_UART_ENABLED",
+                "APP_UART_DRIVER_INSTANCE=0",
+                "NRF_SDH_BLE_ENABLED",
+                "BLE_LINKYT_CONFIG_LOG_ENABLED=1",
+                "BLE_LINKYT_CONFIG_LOG_LEVEL=3",
+                "BLE_LINKYT_CONFIG_INFO_COLOR=0",
+                "BLE_LINKYT_CONFIG_DEBUG_COLOR=0",
+                "BLE_ADVERTISING_ENABLED=1"
+            ],
+            "macFrameworkPath": [],
+            "compilerPath": "/usr/local/bin/arm-none-eabi-gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "clang-x64"
+        }
+    ],
+    "version": 4
+}
